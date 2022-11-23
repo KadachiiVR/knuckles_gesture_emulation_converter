@@ -64,6 +64,14 @@ namespace Kadachii.GestureEmulationConverter
             window.Show();
         }
 
+        private void CreateGeneratedAssetsFolderIfNotPresent()
+        {
+            if (!AssetDatabase.IsValidFolder(GENERATED_ASSET_DIRECTORY))
+            {
+                AssetDatabase.CreateFolder("Assets/Kadachii/KnucklesGestureEmulationConverter", "GeneratedAssets");
+            }
+        }
+
         private void OnEnable()
         {
             headerCols = new MultiColumnHeaderState.Column[] {
@@ -176,6 +184,48 @@ namespace Kadachii.GestureEmulationConverter
             expressionsMenu = avatar.expressionsMenu;
         }*/
 
+        private (bool wd, List<string> paramNames) RecursiveGetAllParamNames(AnimatorStateMachine stateMachine)
+        {
+            wdOn = false;
+            var paramNames = new List<string>();
+            foreach (var state in stateMachine.states)
+            {
+                wdOn = wdOn || state.state.writeDefaultValues;
+                foreach (var t in state.state.transitions)
+                {
+                    foreach (var c in t.conditions)
+                    {
+                        paramNames.Add(c.parameter);
+                    }
+                }
+            }
+
+            foreach (var t in stateMachine.anyStateTransitions)
+            {
+                foreach (var c in t.conditions)
+                {
+                    paramNames.Add(c.parameter);
+                }
+            }
+
+            foreach (var t in stateMachine.entryTransitions)
+            {
+                foreach (var c in t.conditions)
+                {
+                    paramNames.Add(c.parameter);
+                }
+            }
+
+            foreach (var subStateMachine in stateMachine.stateMachines)
+            {
+                var result = RecursiveGetAllParamNames(subStateMachine.stateMachine);
+                wdOn |= result.wd;
+                paramNames.AddRange(result.paramNames);
+            }
+
+            return (wdOn, paramNames);
+        }
+
         private void GuessRelevantLayers()
         {
             fxAnimator = (AnimatorController)avatar.baseAnimationLayers[4].animatorController;
@@ -183,32 +233,9 @@ namespace Kadachii.GestureEmulationConverter
             var ratios = new List<float>();
             foreach (var layer in fxAnimator.layers)
             {
-                var paramNames = new List<string>();
-                foreach (var state in layer.stateMachine.states)
-                {
-                    wdOn = wdOn || state.state.writeDefaultValues;
-                    foreach (var t in state.state.transitions)
-                    {
-                        foreach (var c in t.conditions)
-                        {
-                            paramNames.Add(c.parameter);
-                        }
-                    }
-                }
-                foreach (var t in layer.stateMachine.anyStateTransitions)
-                {
-                    foreach (var c in t.conditions)
-                    {
-                        paramNames.Add(c.parameter);
-                    }
-                }
-                foreach (var t in layer.stateMachine.entryTransitions)
-                {
-                    foreach (var c in t.conditions)
-                    {
-                        paramNames.Add(c.parameter);
-                    }
-                }
+                var result = RecursiveGetAllParamNames(layer.stateMachine);
+                wdOn |= result.wd;
+                var paramNames = result.paramNames;
 
                 var gestureParams = new List<string>(
                     from pName in paramNames
@@ -270,6 +297,7 @@ namespace Kadachii.GestureEmulationConverter
 
         private void Convert()
         {
+            CreateGeneratedAssetsFolderIfNotPresent();
             fxAnimator = (AnimatorController)avatar.baseAnimationLayers[4].animatorController;
             string subFolder = $"{avatar.gameObject.name}_{System.DateTime.Now.ToFileTime()}";
             string guid = AssetDatabase.CreateFolder(GENERATED_ASSET_DIRECTORY, subFolder);
@@ -354,7 +382,173 @@ namespace Kadachii.GestureEmulationConverter
             return layer;
         }
 
+        private static List<AnimatorState> GetStatesRecursive(AnimatorStateMachine sm)
+        {
+            List<AnimatorState> childrenStates = sm.states.Select(x => x.state).ToList();
+            foreach (var child in sm.stateMachines.Select(x => x.stateMachine))
+                childrenStates.AddRange(GetStatesRecursive(child));
+
+            return childrenStates;
+        }
+
+        private static List<AnimatorStateMachine> GetStateMachinesRecursive(AnimatorStateMachine sm,
+            IDictionary<AnimatorStateMachine, AnimatorStateMachine> animatorsByChildren = null)
+        {
+            List<AnimatorStateMachine> childrenSm = sm.stateMachines.Select(x => x.stateMachine).ToList();
+
+            List<AnimatorStateMachine> gcsm = new List<AnimatorStateMachine>();
+            gcsm.Add(sm);
+            foreach (var child in childrenSm)
+            {
+                animatorsByChildren?.Add(child, sm);
+                gcsm.AddRange(GetStateMachinesRecursive(child, animatorsByChildren));
+            }
+
+            return gcsm;
+        }
+
         private AnimatorStateMachine ConvertStateMachineInPlace(AnimatorStateMachine sm)
+        {
+            List<AnimatorState> allStates = GetStatesRecursive(sm);
+            var animatorsByChildren = new Dictionary<AnimatorStateMachine, AnimatorStateMachine>();
+            List<AnimatorStateMachine> allStateMachines = GetStateMachinesRecursive(sm, animatorsByChildren);
+
+            foreach (var state in allStates)
+            {
+                var newTransitions = new List<AnimatorStateTransition>();
+                foreach (int i in Enumerable.Range(0, state.transitions.Length))
+                {
+                    var existingTransition = state.transitions[i];
+                    if (IsTransitionRelevant(existingTransition))
+                    {
+                        AnimatorStateTransition altTransition = null;
+                        if (existingTransition.isExit && existingTransition.destinationState == null && existingTransition.destinationStateMachine == null)
+                        {
+                            altTransition = state.AddExitTransition();
+                        }
+                        else if (existingTransition.destinationState != null)
+                        {
+                            altTransition = state.AddTransition(existingTransition.destinationState);
+                        }
+                        else if (existingTransition.destinationStateMachine != null)
+                        {
+                            altTransition = state.AddTransition(existingTransition.destinationStateMachine);
+                        }
+
+                        if (altTransition != null)
+                        {
+                            ApplyTransitionSettings(existingTransition, altTransition);
+                            altTransition = ConvertTransitionInPlace(altTransition);
+                            newTransitions.Add(altTransition);
+                            existingTransition.AddCondition(AnimatorConditionMode.IfNot, 1, toggleParam);
+                        }
+                    }
+                    newTransitions.Add(existingTransition);
+                }
+                state.transitions = newTransitions.ToArray();
+            }
+            
+            foreach (var ssm in allStateMachines)
+            {
+                if (animatorsByChildren.ContainsKey(ssm))
+                {
+                    var parentSm = animatorsByChildren[ssm];
+                    var newTransitions = new List<AnimatorTransition>();
+                    foreach (var existingTransition in parentSm.GetStateMachineTransitions(ssm))
+                    {
+                        if (IsTransitionRelevant(existingTransition))
+                        {
+                            AnimatorTransition altTransition = null;
+                            if (existingTransition.isExit && existingTransition.destinationState == null && existingTransition.destinationStateMachine == null)
+                            {
+                                altTransition = parentSm.AddStateMachineExitTransition(ssm);
+                            }
+                            else if (existingTransition.destinationState != null)
+                            {
+                                altTransition = parentSm.AddStateMachineTransition(ssm, existingTransition.destinationState);
+                            }
+                            else if (existingTransition.destinationStateMachine != null)
+                            {
+                                altTransition = parentSm.AddStateMachineTransition(ssm, existingTransition.destinationStateMachine);
+                            }
+
+                            if (altTransition != null)
+                            {
+                                ApplyTransitionSettings(existingTransition, altTransition);
+                                altTransition = ConvertTransitionInPlace(altTransition);
+                                newTransitions.Add(altTransition);
+                                existingTransition.AddCondition(AnimatorConditionMode.IfNot, 1, toggleParam);
+                            }
+                        }
+                        newTransitions.Add(existingTransition);
+                    }
+                    parentSm.SetStateMachineTransitions(ssm, newTransitions.ToArray());
+                }
+
+                ConvertStateMachineBaseTransitions(ssm, allStates, allStateMachines);
+            }
+
+            return sm;
+        }
+
+        private void ConvertStateMachineBaseTransitions(AnimatorStateMachine sm, List<AnimatorState> allStates, List<AnimatorStateMachine> allStateMachines)
+        {
+            var newAnyStateTransitions = new List<AnimatorStateTransition>();
+            foreach (var existingTransition in sm.anyStateTransitions)
+            {
+                if (IsTransitionRelevant(existingTransition))
+                {
+                    AnimatorStateTransition altTransition = null;
+                    if (existingTransition.destinationState != null)
+                    {
+                        altTransition = sm.AddAnyStateTransition(existingTransition.destinationState);
+                    }
+                    else if (existingTransition.destinationStateMachine != null)
+                    {
+                        altTransition = sm.AddAnyStateTransition(existingTransition.destinationStateMachine);
+                    }
+
+                    if (altTransition != null)
+                    {
+                        ApplyTransitionSettings(existingTransition, altTransition);
+                        altTransition = ConvertTransitionInPlace(altTransition);
+                        newAnyStateTransitions.Add(altTransition);
+                        existingTransition.AddCondition(AnimatorConditionMode.IfNot, 1, toggleParam);
+                    }
+                }
+                newAnyStateTransitions.Add(existingTransition);
+            }
+            sm.anyStateTransitions = newAnyStateTransitions.ToArray();
+
+            var newEntryTransitions = new List<AnimatorTransition>();
+            foreach (var existingTransition in sm.entryTransitions)
+            {
+                if (IsTransitionRelevant(existingTransition))
+                {
+                    AnimatorTransition altTransition = null;
+                    if (existingTransition.destinationState != null)
+                    {
+                        altTransition = sm.AddEntryTransition(existingTransition.destinationState);
+                    }
+                    else if (existingTransition.destinationStateMachine != null)
+                    {
+                        altTransition = sm.AddEntryTransition(existingTransition.destinationStateMachine);
+                    }
+
+                    if (altTransition != null)
+                    {
+                        ApplyTransitionSettings(existingTransition, altTransition);
+                        altTransition = ConvertTransitionInPlace(altTransition);
+                        newEntryTransitions.Add(altTransition);
+                        existingTransition.AddCondition(AnimatorConditionMode.IfNot, 1, toggleParam);
+                    }
+                }
+                newEntryTransitions.Add(existingTransition);
+            }
+            sm.entryTransitions = newEntryTransitions.ToArray();
+        }
+
+        private AnimatorStateMachine ConvertStateMachineInPlace2(AnimatorStateMachine sm)
         {
             foreach (var state in sm.states)
             {
@@ -382,11 +576,23 @@ namespace Kadachii.GestureEmulationConverter
                 var tr = sm.anyStateTransitions[i];
                 if (IsTransitionRelevant(tr))
                 {
-                    var altTransition = sm.AddAnyStateTransition(tr.destinationState);
-                    ApplyTransitionSettings(tr, altTransition);
-                    altTransition = ConvertTransitionInPlace(altTransition);
-                    newAnyStateTransitions.Add(altTransition);
-                    tr.AddCondition(AnimatorConditionMode.IfNot, 1, toggleParam);
+                    AnimatorStateTransition altTransition = null;
+                    if (tr.destinationState != null)
+                    {
+                        altTransition = sm.AddAnyStateTransition(tr.destinationState);
+                    }
+                    else if (tr.destinationStateMachine != null)
+                    {
+                        altTransition = sm.AddAnyStateTransition(tr.destinationStateMachine);
+                    }
+
+                    if (altTransition != null)
+                    {
+                        ApplyTransitionSettings(tr, altTransition);
+                        altTransition = ConvertTransitionInPlace(altTransition);
+                        newAnyStateTransitions.Add(altTransition);
+                        tr.AddCondition(AnimatorConditionMode.IfNot, 1, toggleParam);
+                    }
                 }
                 newAnyStateTransitions.Add(tr);
             }
@@ -415,6 +621,7 @@ namespace Kadachii.GestureEmulationConverter
                 var nssm = ConvertStateMachineInPlace(ssm.stateMachine);
                 newSubStateMachines[i] = new ChildAnimatorStateMachine() { position = ssm.position, stateMachine = nssm };
             }
+            sm.stateMachines = newSubStateMachines;
 
             return sm;
         }
